@@ -10,10 +10,10 @@ import torch
 import csv
 import os.path as osp
 
-from .environment.rescue_env import RescueConfig, parallel_env, ACTION_MEANINGS
-from .agents.qmix_drqn_agent import DRQNAgent, DRQNConfig
-from .agents.qmix_agent import QMIXAgent, QMIXConfig
-from .evaluate import evaluate_agents
+from environment.rescue_env import RescueConfig, parallel_env, ACTION_MEANINGS
+from agents.qmix_drqn_agent import DRQNAgent, DRQNConfig
+from agents.qmix_agent import QMIXAgent, QMIXConfig
+from evaluate import evaluate_agents
 
 app = FastAPI(title="Multi-Drone Rescue Server")
 
@@ -39,6 +39,11 @@ SESSION: Dict[str, Any] = {
     "manual_agent": 0,
     "record_demo": False,
     "human_path": [],  # list of (x,y)
+    "current_episode": [],  # Store current episode transitions for learning
+    "episodes_completed": 0,  # Track number of episodes completed
+    "online_learning": True,  # Enable online learning
+    "last_obs": None,  # Store last observation for transition
+    "last_actions": None,  # Store last actions for transition
 }
 
 class ResetReq(BaseModel):
@@ -89,6 +94,10 @@ def encode_state(env) -> Dict[str, Any]:
 
 
 def _ckpt_path(n_agents: int) -> str:
+    # Prioritize long-trained model
+    long_path = osp.join("checkpoints", f"drqn_agents_{n_agents}_long", "final", "qmix_drqn.pt")
+    if osp.exists(long_path):
+        return long_path
     return osp.join("checkpoints", f"drqn_agents_{n_agents}", "final", "qmix_drqn.pt")
 
 
@@ -152,28 +161,47 @@ def reset(req: ResetReq):
     obs_dim = len(next(iter(obs.values())))
     state_dim = len(env.state())
 
-    ckpt = os.path.join("checkpoints", f"drqn_agents_{req.agents}", "final", "qmix_drqn.pt")
-    if os.path.exists(ckpt):
-        # Load checkpoint config to instantiate matching architecture
-        try:
-            ckpt_data = torch.load(ckpt, map_location="cpu")
-            ckpt_cfg = ckpt_data.get("cfg", {}) if isinstance(ckpt_data, dict) else {}
-        except Exception:
-            ckpt_cfg = {}
-        agent = DRQNAgent(DRQNConfig(
-            obs_dim=obs_dim,
-            state_dim=state_dim,
-            n_actions=env.num_actions,
-            n_agents=req.agents,
-            device="cpu",
-            hidden_dim=int(ckpt_cfg.get("hidden_dim", 128)),
-            mixer_hidden_dim=int(ckpt_cfg.get("mixer_hidden_dim", 64)),
-        ))
-        agent.load(os.path.dirname(ckpt))
-        agent.epsilon = 0.0 if req.greedy else 0.1
-    else:
+    # Try to load the best available DRQN model (prioritize long-trained)
+    ckpt_dirs = [
+        os.path.join("checkpoints", f"drqn_agents_{req.agents}_long", "final"),
+        os.path.join("checkpoints", f"drqn_agents_{req.agents}", "final")
+    ]
+    
+    agent = None
+    for ckpt_dir in ckpt_dirs:
+        ckpt = os.path.join(ckpt_dir, "qmix_drqn.pt")
+        if os.path.exists(ckpt):
+            # Load checkpoint config to instantiate matching architecture
+            try:
+                ckpt_data = torch.load(ckpt, map_location="cpu")
+                ckpt_cfg = ckpt_data.get("cfg", {}) if isinstance(ckpt_data, dict) else {}
+            except Exception:
+                ckpt_cfg = {}
+            agent = DRQNAgent(DRQNConfig(
+                obs_dim=obs_dim,
+                state_dim=state_dim,
+                n_actions=env.num_actions,
+                n_agents=req.agents,
+                device="cpu",
+                hidden_dim=int(ckpt_cfg.get("hidden_dim", 256)),  # Default to 256 for trained models
+                mixer_hidden_dim=int(ckpt_cfg.get("mixer_hidden_dim", 64)),
+            ))
+            agent.load(ckpt_dir)
+            agent.epsilon = 0.0 if req.greedy else 0.1
+            model_type = "long-trained" if "_long" in ckpt_dir else "regular"
+            print(f"Loaded {model_type} DRQN model from {ckpt_dir}")
+            break
+    
+    # Fallback to QMIX if no DRQN model found
+    if agent is None:
         agent = QMIXAgent(QMIXConfig(obs_dim=obs_dim, state_dim=state_dim, n_actions=env.num_actions, n_agents=req.agents, device="cpu"))
+        print("No DRQN model found, using QMIX fallback")
 
+    # Reset episode tracking for DRQN agents (enable online learning)
+    if isinstance(agent, DRQNAgent):
+        agent.reset_episode()
+        agent.epsilon = 0.0 if req.greedy else 0.1  # Allow some exploration when not greedy
+    
     SESSION["env"] = env
     SESSION["agent"] = agent
     SESSION["greedy"] = req.greedy
@@ -183,6 +211,10 @@ def reset(req: ResetReq):
     SESSION["manual_agent"] = SESSION.get("manual_agent", 0)
     SESSION["record_demo"] = SESSION.get("record_demo", False)
     SESSION["human_path"] = []
+    # Initialize episode tracking
+    SESSION["current_episode"] = []
+    SESSION["last_obs"] = obs
+    SESSION["last_actions"] = None
     return {"ok": True, "state": encode_state(env)}
 
 @app.post("/step")
@@ -192,6 +224,15 @@ def step(req: StepReq):
     if env is None or agent is None:
         return {"ok": False, "error": "Not initialized; call /reset first"}
 
+    # Get last observation for transition storage
+    last_obs = SESSION.get("last_obs")
+    if last_obs is None:
+        last_obs = {aid: env._obs(aid) for aid in env.agents}
+        SESSION["last_obs"] = last_obs
+    
+    # Get current state before action
+    state = env.state()
+    
     # act (auto mode)
     obs, infos = {aid: env._obs(aid) for aid in env.agents}, {aid: {"action_mask": env._action_mask(aid)} for aid in env.agents}
     masks = {aid: infos[aid]["action_mask"] for aid in env.agents}
@@ -210,8 +251,55 @@ def step(req: StepReq):
                         if (adx, ady) == (dx, dy) and _valid_action(list(masks[aid]), a):
                             actions[aid] = a
                             break
+    
+    # Execute step
     next_obs, rewards, terms, truncs, infos2 = env.step(actions)
     done = any(list(terms.values())) or any(list(truncs.values()))
+    next_state = env.state()
+    next_masks = {aid: env._action_mask(aid) for aid in env.agents}
+    
+    # Store transition for online learning (only for DRQN agents)
+    if isinstance(agent, DRQNAgent) and SESSION.get("online_learning", True):
+        # Convert to format expected by replay buffer
+        obs_array = np.array([last_obs[aid] for aid in env.agents])
+        actions_array = np.array([actions[aid] for aid in env.agents])
+        rewards_array = np.array([rewards[aid] for aid in env.agents])
+        next_obs_array = np.array([next_obs[aid] for aid in env.agents])
+        dones_array = np.array([float(terms.get(aid, False) or truncs.get(aid, False)) for aid in env.agents])
+        next_masks_array = np.array([next_masks[aid] for aid in env.agents])
+        
+        transition = {
+            "obs": obs_array,
+            "actions": actions_array,
+            "rewards": rewards_array,
+            "next_obs": next_obs_array,
+            "dones": dones_array,
+            "state": state,
+            "next_state": next_state,
+            "next_masks": next_masks_array,
+        }
+        SESSION["current_episode"].append(transition)
+        
+        # If episode is done, push to replay buffer and train
+        if done:
+            if len(SESSION["current_episode"]) > 0:
+                agent.push_episode(SESSION["current_episode"])
+                SESSION["episodes_completed"] = SESSION.get("episodes_completed", 0) + 1
+                
+                # Train every episode if we have enough data
+                if len(agent.buffer) >= agent.cfg.min_episodes:
+                    loss = agent.train_step()
+                    if loss is not None:
+                        print(f"Online learning - Episode {SESSION['episodes_completed']}: Loss = {loss:.4f}, Buffer size = {len(agent.buffer)}")
+                
+                # Clear current episode
+                SESSION["current_episode"] = []
+            
+            # Reset hidden states for new episode
+            agent.reset_episode()
+    
+    # Update last observation for next transition
+    SESSION["last_obs"] = next_obs
 
     return {
         "ok": True,
@@ -294,10 +382,22 @@ def randomize(req: RandomizeReq):
         # if not initialized, fallback to reset
         r = ResetReq(agents=req.agents or 3, greedy=SESSION.get("greedy", True), seed=req.seed or np.random.randint(0, 10_000))
         return reset(r)
+    
+    # Clear replay buffer when randomizing (new map = fresh start)
+    if isinstance(agent, DRQNAgent):
+        agent.buffer.episodes.clear()
+        agent.reset_episode()
+        print(f"Cleared replay buffer for new randomized map. Starting fresh learning.")
+        SESSION["episodes_completed"] = 0
+    
     seed = req.seed if req.seed is not None else int(np.random.randint(0, 1_000_000))
     obs, _ = env.reset(seed=seed)
     SESSION["greedy"] = bool(req.greedy) if req.greedy is not None else SESSION.get("greedy", True)
     SESSION["human_path"] = []
+    # Reset episode tracking
+    SESSION["current_episode"] = []
+    SESSION["last_obs"] = obs
+    SESSION["last_actions"] = None
     return {"ok": True, "state": encode_state(env)}
 
 
@@ -305,12 +405,24 @@ def randomize(req: RandomizeReq):
 def info():
     env = SESSION.get("env")
     agent = SESSION.get("agent")
+    
+    # Get online learning stats
+    online_learning_stats = {}
+    if isinstance(agent, DRQNAgent):
+        online_learning_stats = {
+            "enabled": SESSION.get("online_learning", True),
+            "episodes_completed": SESSION.get("episodes_completed", 0),
+            "buffer_size": len(agent.buffer),
+            "epsilon": float(agent.epsilon),
+        }
+    
     session = {
         "initialized": env is not None and agent is not None,
         "greedy": SESSION.get("greedy", True),
         "n_agents": getattr(env, "num_agents", None) if env is not None else None,
         "grid_size": getattr(env, "grid_size", None) if env is not None else None,
         "agent_type": agent.__class__.__name__ if agent is not None else None,
+        "online_learning": online_learning_stats,
     }
     availability = {
         "checkpoints": {

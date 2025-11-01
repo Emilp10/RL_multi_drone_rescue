@@ -26,7 +26,7 @@ class DRQNConfig:
     epsilon_start: float = 1.0
     epsilon_end: float = 0.10
     epsilon_decay_steps: int = 60000
-    hidden_dim: int = 128
+    hidden_dim: int = 256
     mixer_hidden_dim: int = 64
     seq_len: int = 48
     burn_in: int = 12

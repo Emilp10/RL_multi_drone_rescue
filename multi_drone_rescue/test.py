@@ -28,23 +28,31 @@ def main():
         obs_sample, _ = env.reset()
         obs_dim = len(next(iter(obs_sample.values())))
         state_dim = len(env.state())
-        # Prefer DRQN
-        ckpt_dir = os.path.join("checkpoints", f"drqn_agents_{n_agents}", "final")
+        # Prefer DRQN (try long-trained first, then regular)
+        ckpt_dirs = [
+            os.path.join("checkpoints", f"drqn_agents_{n_agents}_long", "final"),
+            os.path.join("checkpoints", f"drqn_agents_{n_agents}", "final")
+        ]
+        
         agent = DRQNAgent(DRQNConfig(obs_dim=obs_dim, state_dim=state_dim, n_actions=env.num_actions, n_agents=n_agents, device="cpu"))
-        if os.path.exists(os.path.join(ckpt_dir, "qmix_drqn.pt")):
-            agent.load(ckpt_dir)
-            agent.epsilon = 0.0
-            print("Loaded trained DRQN model.")
-        else:
-            # Fallback to QMIX
-            qm_ckpt = os.path.join("checkpoints", "final")
-            qagent = QMIXAgent(QMIXConfig(obs_dim=obs_dim, state_dim=state_dim, n_actions=env.num_actions, n_agents=n_agents, device="cpu"))
-            if os.path.exists(os.path.join(qm_ckpt, "qmix.pt")):
-                qagent.load(qm_ckpt)
-                qagent.epsilon = 0.0
-                print("Loaded legacy QMIX model.")
-                return env, qagent
-            print("No trained model found. Using epsilon policy.")
+        
+        for ckpt_dir in ckpt_dirs:
+            if os.path.exists(os.path.join(ckpt_dir, "qmix_drqn.pt")):
+                agent.load(ckpt_dir)
+                agent.epsilon = 0.0
+                model_type = "long-trained" if "_long" in ckpt_dir else "regular"
+                print(f"Loaded {model_type} DRQN model from {ckpt_dir}")
+                return env, agent
+        
+        # Fallback to QMIX
+        qm_ckpt = os.path.join("checkpoints", "final")
+        qagent = QMIXAgent(QMIXConfig(obs_dim=obs_dim, state_dim=state_dim, n_actions=env.num_actions, n_agents=n_agents, device="cpu"))
+        if os.path.exists(os.path.join(qm_ckpt, "qmix.pt")):
+            qagent.load(qm_ckpt)
+            qagent.epsilon = 0.0
+            print("Loaded legacy QMIX model.")
+            return env, qagent
+        print("No trained model found. Using epsilon policy.")
         return env, agent
 
     env, agent = build_env_and_agent(3)

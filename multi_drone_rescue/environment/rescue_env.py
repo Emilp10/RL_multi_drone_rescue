@@ -28,7 +28,7 @@ from dataclasses import dataclass
 from typing import Dict, List, Tuple, Optional
 import numpy as np
 
-from .utils import in_bounds, fov_cells
+from environment.utils import in_bounds, fov_cells
 
 
 @dataclass

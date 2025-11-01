@@ -8,9 +8,9 @@ import json
 import numpy as np
 import torch
 
-from .environment.rescue_env import RescueConfig, parallel_env
-from .agents.qmix_drqn_agent import DRQNAgent, DRQNConfig
-from .agents.qmix_agent import QMIXAgent, QMIXConfig
+from environment.rescue_env import RescueConfig, parallel_env
+from agents.qmix_drqn_agent import DRQNAgent, DRQNConfig
+from agents.qmix_agent import QMIXAgent, QMIXConfig
 
 
 def _ckpt_dir(n_agents: int, override: str | None = None) -> str:
