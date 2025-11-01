@@ -1,0 +1,7 @@
+numpy>=1.22
+pygame>=2.3
+pettingzoo>=1.24
+gymnasium>=0.29
+torch>=2.1
+fastapi
+uvicorn
