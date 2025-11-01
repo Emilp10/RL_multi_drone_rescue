@@ -1,4 +1,4 @@
-# RL_try2 - Multi-Agent Reinforcement Learning Project
+# RL - Multi-Agent Reinforcement Learning Project
 
 This project implements a multi-agent reinforcement learning system for drone rescue scenarios, featuring both training infrastructure and a web-based frontend for visualization and interaction.
 
